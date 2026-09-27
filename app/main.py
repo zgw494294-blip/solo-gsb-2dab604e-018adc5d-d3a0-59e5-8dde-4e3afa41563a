@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import AliasChoices, BaseModel, Field
 
 from . import store as zone_store
+from .masterfile import MasterFileError, parse_master_file
 from .resolver import Resolution, ZoneError, build_zone, normalize_name, resolve
 from .zoneupdate import (
     normalize_operation,
@@ -83,6 +84,7 @@ def index() -> dict[str, str]:
         "docs": "/docs",
         "resolve": "POST /resolve",
         "zones": "POST /zones",
+        "zones_import": "POST /zones/import",
     }
 
 
@@ -187,6 +189,36 @@ def create_zone(req: ZoneCreateRequest) -> ZoneSnapshot:
     try:
         records = {normalize_record(r.name, r.type, r.value) for r in req.records}
         zone = build_zone(req.zone, sorted(records))
+    except ZoneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _snapshot_response(zone_store.get_store().create(zone.apex, records))
+
+
+class ZoneImportRequest(BaseModel):
+    zone: str = Field(..., examples=["example.com"])
+    text: str = Field(
+        ...,
+        examples=[
+            "; a tiny master file\n"
+            "$ORIGIN example.com.\n"
+            "@ 300 IN NS ns1.example.net.\n"
+            "www IN A 192.0.2.1\n"
+            "  300 IN A 192.0.2.2\n"
+            "alias CNAME www\n"
+        ],
+        description="DNS master-file text; only A, CNAME and NS records are accepted",
+    )
+
+
+@app.post("/zones/import", response_model=ZoneSnapshot)
+def import_zone(req: ZoneImportRequest) -> ZoneSnapshot:
+    try:
+        records = parse_master_file(req.zone, req.text)
+        zone = build_zone(req.zone, sorted(records))
+    except MasterFileError as exc:
+        raise HTTPException(
+            status_code=422, detail={"line": exc.line, "error": str(exc)}
+        ) from exc
     except ZoneError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _snapshot_response(zone_store.get_store().create(zone.apex, records))

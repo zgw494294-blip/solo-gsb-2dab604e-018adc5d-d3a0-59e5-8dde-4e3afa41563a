@@ -1,6 +1,6 @@
 # 离线 DNS 区域应答 API
 
-基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**。
+基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**。`POST /zones/import` 还可直接导入 **DNS 主文件（master file）子集** 生成版本 0 快照。
 
 ## 启动
 
@@ -142,6 +142,31 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **委派子树内的输入记录原样保留**（glue 及其他暂非权威的记录都存入快照），不经过解析时的裁剪。
 - 响应 `200`：`{"id": "...", "version": 0, "zone": "example.com.", "records": [...]}`，其中 `records` 为规范化、去重后按 `(name, type, value)` 排序的完整快照。
 
+### `POST /zones/import`
+
+把 **DNS 主文件（master file）子集** 文本导入为版本 `0` 快照。请求体：
+
+```json
+{
+  "zone": "example.com",
+  "text": "$ORIGIN example.com.\n@ IN NS ns1.example.net.\nwww 300 IN A 192.0.2.1\n    IN A 192.0.2.2\nalias IN CNAME www\n"
+}
+```
+
+响应与 `POST /zones` 完全相同（`{"id", "version": 0, "zone", "records"}`）；记录同样经过**规范化、去重、按 `(name, type, value)` 排序**，区域整体沿用与 `/zones` 相同的规则校验，版本 `0` 在同一事务中留档。任何失败都不会创建快照。
+
+支持的主文件语法（RFC 1035 §5.1 的一个严格子集）：
+
+- **仅支持 `A`、`CNAME`、`NS` 三种记录类型**；其他类型一律拒绝。
+- **分号 `;` 起到行尾为注释**；引号、转义（`\`）、其他指令（如 `$INCLUDE`、`$GENERATE`）一律拒绝。
+- **非嵌套括号**允许一条记录跨越多行；括号嵌套、括号不配对返回 `422`。
+- 初始 origin 为请求中的 `zone`；支持 **`$ORIGIN`**（必须顶格书写）。`@` 表示当前 origin；无尾点的记录名、CNAME/NS 目标以及 `$ORIGIN` 参数均**相对当前 origin**展开，带尾点为绝对名称。
+- 逻辑记录**首字符为空白**（空格或制表符）时沿用上一条记录**已展开的绝对名称**；切换 `$ORIGIN` 不改变该名称（下一条显式写名的记录才使用新 origin）；首条记录即省名返回 `422`。空行与纯注释行不影响省名延续。
+- 类型前可**省略或填写** `IN` 类别与**非负十进制 TTL**，二者顺序不限、均可省略、各至多一次；支持 **`$TTL`**。TTL（含 `$TTL`）**只校验、不存储**（要求为非负十进制整数，负数或其他写法拒绝）；除 `IN` 外的类别拒绝。
+- 语法错误返回 `422`，响应体为 `{"detail": {"line": <逻辑记录起始行号>, "error": "..."}}`（行号从 1 开始，跨行记录报其首行）；区域级校验失败（如顶点 NS、嵌套委派、CNAME 与其他记录同名、记录名在区域外等）同样返回 `422`。
+
+导入示例见文末[示例](#示例)小节。
+
 ### `GET /zones/{id}`
 
 读取快照，返回 `{"id", "version", "zone", "records"}`；`records` 可直接作为 `POST /resolve` 的 `records` 字段使用。未知 id 返回 `404`。
@@ -272,6 +297,39 @@ curl -s "http://localhost:8000/zones/$ZID/diff?from_version=0&to_version=1"
 # => {"zone":"example.com.","from_version":0,"to_version":1,
 #     "removed":[{"name":"www.example.com.","type":"A","value":"192.0.2.1"}],
 #     "added":[{"name":"www.example.com.","type":"A","value":"192.0.2.2"}]}
+```
+
+从 DNS 主文件文本导入（`POST /zones/import`，服务地址同上：`http://localhost:8000`）：
+
+```bash
+curl -s http://localhost:8000/zones/import \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{
+  "zone": "example.com",
+  "text": "; master-file subset\n$ORIGIN example.com.\nwww 300 IN A 192.0.2.1\n    IN A 192.0.2.2\nalias IN CNAME www\ndel IN NS ns1.del\nns1.del IN A 198.51.100.1\n"
+}
+JSON
+# => {"id":"...","version":0,"zone":"example.com.","records":[
+#      {"name":"alias.example.com.","type":"CNAME","value":"www.example.com."},
+#      {"name":"del.example.com.","type":"NS","value":"ns1.del.example.com."},
+#      {"name":"ns1.del.example.com.","type":"A","value":"198.51.100.1"},
+#      {"name":"www.example.com.","type":"A","value":"192.0.2.1"},
+#      {"name":"www.example.com.","type":"A","value":"192.0.2.2"}]}
+```
+
+也可以先把主文件写到 `zone.txt`，再用 `jq` 组装请求：
+
+```bash
+jq -Rs '{zone: "example.com", text: .}' zone.txt \
+  | curl -s http://localhost:8000/zones/import \
+      -H 'Content-Type: application/json' --data-binary @-
+```
+
+语法错误时返回 `422` 与逻辑记录起始行号，例如：
+
+```json
+{"detail": {"line": 4, "error": "line 4: unsupported record type 'MX'; only A, CNAME and NS"}}
 ```
 
 ## 测试
