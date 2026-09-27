@@ -1,6 +1,6 @@
 # 离线 DNS 区域应答 API
 
-基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**。
+基于 FastAPI 的离线 DNS 区域解析服务：在请求体中携带整个区域数据，对查询域名执行 **A 查询** 解析，支持 CNAME 链、通配符与 **NS 区域委派**。同时提供 **区域快照与条件更新** 模块：区域数据持久化在 SQLite 中，可按版本与前置条件进行原子更新，并对每个已提交版本留档，支持任意两个版本间的 **差异导出**；也可以把 **DNS 主文件（zone file）文本** 直接导入为版本 0 快照。
 
 ## 启动
 
@@ -142,6 +142,34 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **委派子树内的输入记录原样保留**（glue 及其他暂非权威的记录都存入快照），不经过解析时的裁剪。
 - 响应 `200`：`{"id": "...", "version": 0, "zone": "example.com.", "records": [...]}`，其中 `records` 为规范化、去重后按 `(name, type, value)` 排序的完整快照。
 
+### `POST /zones/import`
+
+把 **DNS 主文件（zone file）文本** 解析并导入为版本 `0` 的快照。请求体为 `zone` 与 `text` 两个字段：
+
+```json
+{
+  "zone": "example.com",
+  "text": "$TTL 3600\n$ORIGIN example.com.\n@    A    192.0.2.1\nwww  A    192.0.2.2\n     A    192.0.2.3\nalias CNAME www\ndel  NS    ns1.del\nns1.del A 198.51.100.10\n"
+}
+```
+
+支持的语法（RFC 1035 主文件的严格子集）：
+
+- 仅支持 `A`、`CNAME`、`NS` 三种记录类型（大小写不限），其他类型一律拒绝。
+- `;` 起到行尾为注释；空行被忽略。
+- 括号 `(` `)` 允许一条逻辑记录跨越多行；括号不可嵌套，未闭合或不配对均报错。
+- 初始 origin 为 `zone`；`$ORIGIN <名>` 切换当前 origin。
+- `@` 表示当前 origin；无尾点的**记录名、CNAME/NS 目标与 `$ORIGIN` 参数**均相对当前 origin 展开，带尾点的名为绝对名。
+- 逻辑记录首字符为空白（空格或制表符）时省略记录名，沿用上一条记录**已展开**的名称；切换 origin 不改变该名称；首条记录省名报错。
+- 类型之前可省略或填写 `IN` 与非负十进制 TTL，二者顺序不限；`$TTL` 指令同理。**TTL 只校验不存储**。
+- 引号、转义（`\`）以及其他 `$` 指令（如 `$INCLUDE`、`$GENERATE`）均拒绝。
+
+行为：
+
+- **语法错误**返回 `422`，`detail` 为 `{"line": <逻辑记录起始行号>, "message": "<原因>"}`；跨行记录的行号取其起始物理行。
+- 解析出的记录复用与 `POST /zones` 完全相同的规范化、去重、排序与整体区域校验；区域非法返回 `422`（`detail` 为字符串）。**任何失败都不建快照**。
+- 成功时响应与 `POST /zones` 相同：`{"id", "version": 0, "zone", "records"}`，版本 `0` 同时留档，可直接用于后续 `GET /zones/{id}`、`updates` 与 `diff`。
+
 ### `GET /zones/{id}`
 
 读取快照，返回 `{"id", "version", "zone", "records"}`；`records` 可直接作为 `POST /resolve` 的 `records` 字段使用。未知 id 返回 `404`。
@@ -249,7 +277,6 @@ curl -s http://localhost:8000/zones \
   -H 'Content-Type: application/json' \
   -d '{"zone": "example.com",
        "records": [{"name": "www.example.com", "type": "A", "value": "192.0.2.1"}]}'
-
 # 读取快照
 curl -s http://localhost:8000/zones/$ZID
 
@@ -272,6 +299,24 @@ curl -s "http://localhost:8000/zones/$ZID/diff?from_version=0&to_version=1"
 # => {"zone":"example.com.","from_version":0,"to_version":1,
 #     "removed":[{"name":"www.example.com.","type":"A","value":"192.0.2.1"}],
 #     "added":[{"name":"www.example.com.","type":"A","value":"192.0.2.2"}]}
+```
+
+从主文件文本导入区域（同样得到版本 0 快照，记下返回的 id 即可接上面的读取/更新/差异命令）：
+
+```bash
+curl -s http://localhost:8000/zones/import \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zone": "example.com",
+        "text": "$TTL 3600\n$ORIGIN example.com.\n@    A     192.0.2.1\nwww  A     192.0.2.2\n     A     192.0.2.3\nalias CNAME www\ndel  NS    ns1.del\nns1.del A (\n  198.51.100.10 )\n"
+      }'
+# => {"id":"...","version":0,"zone":"example.com.","records":[
+#      {"name":"alias.example.com.","type":"CNAME","value":"www.example.com."},
+#      {"name":"del.example.com.","type":"NS","value":"ns1.del.example.com."},
+#      {"name":"example.com.","type":"A","value":"192.0.2.1"},
+#      {"name":"ns1.del.example.com.","type":"A","value":"198.51.100.10"},
+#      {"name":"www.example.com.","type":"A","value":"192.0.2.2"},
+#      {"name":"www.example.com.","type":"A","value":"192.0.2.3"}]}
 ```
 
 ## 测试

@@ -8,6 +8,7 @@ from pydantic import AliasChoices, BaseModel, Field
 
 from . import store as zone_store
 from .resolver import Resolution, ZoneError, build_zone, normalize_name, resolve
+from .zonefile import MasterFileError, parse_zone_file
 from .zoneupdate import (
     normalize_operation,
     normalize_prerequisite,
@@ -83,6 +84,7 @@ def index() -> dict[str, str]:
         "docs": "/docs",
         "resolve": "POST /resolve",
         "zones": "POST /zones",
+        "import": "POST /zones/import",
     }
 
 
@@ -187,6 +189,32 @@ def create_zone(req: ZoneCreateRequest) -> ZoneSnapshot:
     try:
         records = {normalize_record(r.name, r.type, r.value) for r in req.records}
         zone = build_zone(req.zone, sorted(records))
+    except ZoneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _snapshot_response(zone_store.get_store().create(zone.apex, records))
+
+
+class ZoneImportRequest(BaseModel):
+    zone: str = Field(..., examples=["example.com"])
+    text: str = Field(
+        ...,
+        description="DNS master file subset: A/CNAME/NS records, $ORIGIN/$TTL "
+        "directives, ';' comments and parentheses",
+        examples=["$TTL 3600\nwww A 192.0.2.1\n"],
+    )
+
+
+@app.post("/zones/import", response_model=ZoneSnapshot)
+def import_zone(req: ZoneImportRequest) -> ZoneSnapshot:
+    try:
+        parsed = parse_zone_file(req.zone, req.text)
+        records = {normalize_record(n, t, v) for n, t, v in parsed}
+        zone = build_zone(req.zone, sorted(records))
+    except MasterFileError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"line": exc.line, "message": exc.message},
+        ) from exc
     except ZoneError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _snapshot_response(zone_store.get_store().create(zone.apex, records))
